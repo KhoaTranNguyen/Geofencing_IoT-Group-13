@@ -1,0 +1,1337 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title></title>
+
+    <meta charset="utf-8">
+
+    <!-- Ensures that Internet Explorer and Edge uses the latest version and doesn't emulate an older version -->
+    <meta http-equiv="x-ua-compatible" content="IE=Edge">
+
+    <!-- Ensures the web page looks good on all screen sizes. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+
+    <!-- Add references to the Azure Maps Map control JavaScript and CSS files. -->
+    <link rel="stylesheet" href="https://atlas.microsoft.com/sdk/javascript/mapcontrol/3/atlas.min.css" type="text/css">
+    <script src="https://atlas.microsoft.com/sdk/javascript/mapcontrol/3/atlas.min.js"></script>
+    <!-- OpenLayers CDN -->
+
+    <link rel="stylesheet" href="https://atlas.microsoft.com/sdk/javascript/drawing/1/atlas-drawing.min.css"
+        type="text/css" />
+    <script src="https://atlas.microsoft.com/sdk/javascript/drawing/1/atlas-drawing.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/microsoft-signalr/7.0.5/signalr.min.js"></script>
+    <script type="text/javascript">
+        //Create an instance of the map control and set some options.
+        var drawingManager;
+        var map;
+        var geofenceDatasource;
+        var resultDatasource;
+        var routeDatasource;
+        var resultLayer;
+        var countGeofence = 0;
+        var arrayGeofence = [];
+        let moving = false;  // Declare at top-level (global scope)
+        var realTimeMarker = null; // ADD: Marker for the real-time GPS location
+        var signalRConnection = null; // ADD: Holds the SignalR connection object
+        var simulationCarSymbol = null; 
+        const NEGOTIATE_URL = location.hostname === "localhost"
+          ? "http://localhost:7071/api/negotiate" // ⚠️ WARNING: You may need to change this localhost
+          : "https://mygpsfuncapp.azurewebsites.net/api/negotiate";
+        function getRandomColor() {
+            const letters = '0123456789ABCDEF';
+            let color = '#';
+            for (let i = 0; i < 6; i++) {
+                color += letters[Math.floor(Math.random() * 16)];
+            }
+            return color;
+        }
+        function InitMap() {
+            var countGeofence = 0;
+            map = new atlas.Map('myMap', {
+                center: [106.612685, 11.107935],
+                zoom: 17,
+                language: 'vi-VN',
+                authOptions: {
+                    authType: 'subscriptionKey',
+                    subscriptionKey: 'YOUR-SUBSCRIPTION-KEY' // ⚠️ WARNING: Identifying your map subscription key, use Ctrl+F to search all required fields
+                }
+            });
+            //Create an instance of the drawing manager and set drawing mode.
+            map.events.add("load", function () {
+                map.controls.add(new atlas.control.StyleControl({
+                    mapStyles: ['road', 'road_shaded_relief', 'grayscale_light', 'night', 'grayscale_dark', 'satellite', 'satellite_road_labels']
+                }), {
+                    position: 'top-left'
+                });
+                drawingManager = new atlas.drawing.DrawingManager(map, {
+                    toolbar: new atlas.control.DrawingToolbar({ position: 'top-right', style: 'light' }),
+                    mode: "draw-polygon",
+                    interactionType: "click",
+                    freehandInterval: 3,
+                    shapeDraggingEnabled: true,
+                    shapeRotationEnabled: true,
+
+                });
+                //Create a data source and add it to the map.
+                resultDatasource = new atlas.source.DataSource();
+                geofenceDatasource = new atlas.source.DataSource();
+                routeDatasource = new atlas.source.DataSource();
+                map.sources.add(routeDatasource);
+                map.sources.add(resultDatasource);
+                map.sources.add(geofenceDatasource);
+                map.layers.add(new atlas.layer.LineLayer(routeDatasource, null, {
+                    strokeColor: 'dodgerblue',   // Customize color
+                    strokeWidth: 5,              // Customize thickness
+                    lineJoin: 'round',
+                    lineCap: 'round'
+                }));
+                map.layers.add(new atlas.layer.SymbolLayer(routeDatasource, null, {
+                    iconOptions: {
+                        image: 'pin-round-blue',
+                        anchor: 'center'
+                    },
+                    textOptions: {
+                        textField: ['get', 'title'],
+                        offset: [0, 1.2]
+                    }
+                }));
+                //Add a layer for rendering point data.
+                resultLayer = new atlas.layer.SymbolLayer(resultDatasource, null, {
+                    iconOptions: {
+                        image: 'pin-round-darkblue',
+                        anchor: 'center',
+                        allowOverlap: true
+                    },
+                    textOptions: {
+                        anchor: "top"
+                    }
+                });
+
+                map.layers.add(resultLayer);
+
+                // Create a popup but leave it closed so we can update it and display it later.
+                popup = new atlas.Popup();
+
+                //Add a mouse over event to the result layer and display a popup when this event fires.
+                map.events.add('mouseover', resultLayer, showPopup);
+                function showPopup(e) {
+                    var p = e.shapes[0].getProperties();
+                    var position = e.shapes[0].getCoordinates();
+
+                    var name = p.poi?.name || "No name available";
+                    var address = p.address?.freeformAddress || "No address available";
+
+                    var html = `
+                    <div style="padding:5px">
+                        <div><b>${name}</b></div>
+                        <div>${address}</div>
+                        <div>${position[1]}, ${position[0]}</div>
+                    </div>`;
+
+                    popup.setPopupOptions({
+                        content: html,
+                        position: position
+                    });
+
+                    popup.open(map);
+                }
+
+
+                map.events.add('drawingcomplete', drawingManager, function (shape) {
+                    const drawnFeatures = drawingManager.getSource().toJson().features;
+                    if (drawnFeatures.length > 0) {
+
+                        const geojson = drawnFeatures[drawnFeatures.length - 1];
+                        console.log("Drawn GeoJSON:", geojson);
+                        console.log("Drawn GeoJSON type:", geojson.geometry.type);
+                        console.log("Drawn geofences: ", drawingManager.getSource().toJson().features);
+                        // **Add the shape into the datasource used by PolygonLayer**
+                        geofenceDatasource.add(new atlas.Shape(geojson));
+                        // You can now display this GeoJSON data in your sidePanel or do something else with it
+                        document.getElementById('CodeOutput').textContent = JSON.stringify(geojson, null, 2);
+                        if (geojson.geometry.type === 'Point' && !geojson.properties.subType) {
+                            arrayGeofence.push(geojson.geometry.coordinates);
+                        }
+                        if (arrayGeofence.length == 2) {
+                            const startPoint = arrayGeofence[0];
+                            const endPoint = arrayGeofence[1];
+                            console.log("Start Point: ", startPoint);
+                            console.log("End Point: ", endPoint);
+                            // Call the function to search for a route
+                            searchRoute(startPoint[1], startPoint[0], endPoint[1], endPoint[0]);
+                            arrayGeofence = [];
+                        }
+                    }
+                    console.log("Test:", geofenceDatasource);
+                });
+                realTimeMarker = new atlas.HtmlMarker({
+                    htmlContent: `
+                        <div style="
+                        background: deepskyblue; /* Or red like the original */
+                        width: 20px;
+                        height: 20px;
+                        border-radius: 50%;
+                        border: 3px solid white;
+                        box-shadow: 0 0 10px rgba(0,0,0,0.5);
+                        "></div>
+                    `,
+                    position: map.getCamera().center, // Start at map center initially
+                    visible: false // Hide until first GPS data arrives
+                });
+                map.markers.add(realTimeMarker);
+                console.log("Real-time marker created.");
+                connectSignalR();
+            });
+            function showToolbar(elm) {
+                if (elm.checked) {
+                    drawingManager.setOptions({ toolbar: new atlas.control.DrawingToolbar({ position: 'top-right', style: 'light' }) });
+                } else {
+                    drawingManager.setOptions({ toolbar: null });
+                }
+            }
+
+            function updateDraiwngMode(elm) {
+                drawingManager.setOptions({ mode: elm.options[elm.selectedIndex].value });
+            }
+
+            function updateInteractionType(elm) {
+                drawingManager.setOptions({ interactionType: elm.options[elm.selectedIndex].value });
+            }
+
+            function updateFreehandInterval(elm) {
+                drawingManager.setOptions({ freehandInterval: parseInt(elm.options[elm.selectedIndex].value) });
+            }
+
+            function updateShapeDragging(elm) {
+                drawingManager.setOptions({ shapeDraggingEnabled: elm.checked });
+            }
+
+            function updateShapeRotation(elm) {
+                drawingManager.setOptions({ shapeRotationEnabled: elm.checked });
+            }
+
+        }
+        function deleteGeofenceById(shapeId) {
+            const drawnFeatures = drawingManager.getSource().toJson().features;
+            const shape = drawnFeatures.find(feature => feature.properties.id === shapeId);
+            if (shape) {
+                geofenceDatasource.remove(shape);  // Remove the shape from the datasource
+                console.log(`Shape deleted: ${shapeId}`);
+            } else {
+                console.error('Shape not found in datasource');
+            }
+        }
+        
+        // ADD: New Function for SignalR Connection Logic
+        async function connectSignalR() {
+            // Prevent multiple connections
+            if (signalRConnection && signalRConnection.state === signalR.HubConnectionState.Connected) {
+                console.log("SignalR already connected.");
+                return;
+            }
+             if (signalRConnection && signalRConnection.state === signalR.HubConnectionState.Connecting) {
+                 console.log("SignalR connection attempt already in progress.");
+                 return;
+             }
+
+            const statusEl = document.getElementById('status'); // Get status element
+
+            try {
+                statusEl.textContent = 'Connecting to SignalR...';
+                console.log(`Attempting to negotiate SignalR connection at: ${NEGOTIATE_URL}`);
+
+                // 1. Negotiate connection
+                const negotiateResponse = await fetch(NEGOTIATE_URL, {
+                    method: 'POST', // Or GET depending on your function trigger
+                    headers: { 'Content-Type': 'application/json' }
+                    // Add any required headers for auth if your negotiate function needs it
+                });
+
+                if (!negotiateResponse.ok) {
+                     const errorText = await negotiateResponse.text();
+                     throw new Error(`Negotiation failed! Status: ${negotiateResponse.status}. Response: ${errorText}`);
+                }
+
+                const rawText = await negotiateResponse.text();
+                console.log('Negotiate raw response:', rawText);
+                let connectionInfo;
+                try {
+                    // Handle potential double-stringified JSON
+                    connectionInfo = JSON.parse(rawText);
+                    if (typeof connectionInfo === "string") {
+                        connectionInfo = JSON.parse(connectionInfo);
+                    }
+                } catch (e) {
+                    throw new Error(`Failed to parse connection info: ${e.message}. Raw text: ${rawText}`);
+                }
+
+                console.log('Parsed connection info:', connectionInfo);
+
+                if (!connectionInfo.url || !connectionInfo.accessToken) {
+                    throw new Error("Negotiation response missing 'url' or 'accessToken'.");
+                }
+
+                // 2. Create connection object
+                signalRConnection = new signalR.HubConnectionBuilder()
+                    .withUrl(connectionInfo.url, {
+                        accessTokenFactory: () => connectionInfo.accessToken
+                    })
+                    .withAutomaticReconnect([0, 2000, 10000, 30000]) // Optional: configure reconnect delays
+                    .configureLogging(signalR.LogLevel.Information) // Log SignalR events
+                    .build();
+
+                 // --- SignalR Event Handlers ---
+
+                 // Handle receiving new GPS data
+                signalRConnection.on('newGpsLocation', (data) => {
+                    // Basic validation
+                    if (!data || typeof data.longitude !== 'number' || typeof data.latitude !== 'number') {
+                         console.warn("Received invalid GPS data format:", data);
+                        return;
+                    }
+
+                    const position = [data.longitude, data.latitude];
+                    console.log('Real-Time GPS Update:', position);
+
+                    // Use the globally defined realTimeMarker
+                    if (realTimeMarker) {
+                        realTimeMarker.setOptions({
+                            position: position,
+                            visible: true // Make sure it's visible
+                        });
+
+                        // Update status display
+                        statusEl.innerHTML = `
+                            <strong>Real-Time Tracking Active</strong><br>
+                            Lat: ${data.latitude.toFixed(6)}<br>
+                            Lon: ${data.longitude.toFixed(6)}<br>
+                            ${data.timestamp ? 'Time: ' + new Date(data.timestamp*1000).toLocaleTimeString() : ''}
+                            ${data.deviceId ? '<br>Device: ' + data.deviceId : ''}
+                        `;
+
+                        // OPTIONAL: Center map on updates (can be annoying)
+                        // map.setCamera({ center: position });
+
+                        // OPTIONAL: Trigger geofence check for real-time data
+                        /*
+                        if (geofenceDatasource.getShapes().length > 0) {
+                            checkGeofence(data.latitude, data.longitude, geofenceDatasource.toJson())
+                                .then(result => {
+                                     // Process result...
+                                     console.log("Real-time Geofence Check:", result);
+                                });
+                        }
+                        */
+
+                    } else {
+                        console.error("realTimeMarker not initialized when GPS data received.");
+                    }
+                    // --- GET AND PREPARE GEOFENCE DATA ONCE ---
+                    var geoJSONData = drawingManager.getSource().toJson();   
+                    console.log("GeoJSON Data:", geoJSONData);
+                    var validJSON = {
+                        type: "FeatureCollection",
+                        features: []
+                    };    
+                    for (let i = 0; i < geoJSONData.features.length; i++) 
+                    {
+                        if(geoJSONData.features[i].geometry.type == "Point" && !geoJSONData.features[i].properties.subType){
+                            console.warn("Invalid geofence found in the drawing manager source.");
+                            continue;
+                        }
+                        if (!geoJSONData.features[i].properties) {
+                            geoJSONData.features[i].properties = {};
+                        }
+                        geoJSONData.features[i].properties.geometryId = (i + 1).toString();
+                        validJSON.features.push(geoJSONData.features[i]);
+                    }
+                    const geofenceDataForCheck = validJSON;
+                    console.log("Geofence Data for Check:", geofenceDataForCheck);
+
+                    if(geofenceDataForCheck.features.length === 0){
+                        console.warn("No valid Polygon geofences found in the drawing manager source to check against.");
+                    } else {
+                        console.log("Prepared geofence data for checking:", geofenceDataForCheck);
+                    }
+                    // --- END GET GEOFENCE DATA ---
+                    document.addEventListener("DOMContentLoaded", function () {
+                        document.getElementById("approach").innerText = "Starting...";
+                        document.getElementById("geofence").innerText = "Starting...";
+                    });
+                    // --- Corrected start function with throttling and async handling ---
+                    const approachEl = document.getElementById("approach");
+                    const geofenceEl = document.getElementById("geofence");
+                    // Call checkGeofence (which is async), handle result with .then()
+                    checkGeofence(
+                        data.latitude.toString(),
+                        data.longitude.toString(),
+                        geofenceDataForCheck
+                    ).then(result => {
+                        if (result && result.geometries) {
+                            let insideAny = false;
+                            let insideIds = [];
+                            let minDistance = Infinity;
+                            let minDistanceId = null;
+
+                            for (let i = 0; i < result.geometries.length; i++) {
+                                let miniMin = Infinity;
+
+                                // console.log("CHECKKKK",geofenceDataForCheck);
+                                for(let k = 0; k < geofenceDataForCheck.features.length; k++){
+                                    if(geofenceDataForCheck.features[k].geometry.type === "Polygon"
+                                        && Array.isArray(geofenceDataForCheck.features[k].geometry.coordinates)
+                                        && Array.isArray(geofenceDataForCheck.features[k].geometry.coordinates[0])){
+                                            const coords = geofenceDataForCheck.features[k].geometry.coordinates[0]; // Outer ring
+                                            // let miniMin = Infinity;
+
+                                            for (let j = 0; j < coords.length - 1; j++) {
+                                                const [lon1, lat1] = coords[j];
+                                                const [lon2, lat2] = coords[j + 1];
+
+                                                const distance = pointToSegmentDistance(
+                                                    data.latitude,
+                                                    data.longitude,
+                                                    lat1, lon1,
+                                                    lat2, lon2
+                                                );
+
+                                                if (distance < miniMin) {
+                                                    miniMin = distance;
+                                                }
+                                            }
+
+                                            // Check if the point is inside the polygon
+                                            const inside = isPointInsidePolygon(
+                                                [data.longitude, data.latitude], coords
+                                            );
+                                        }
+                                    else if(geofenceDataForCheck.features[k].geometry.type === "Point"
+                                            && geofenceDataForCheck.features[k].properties.subType === "Circle"){
+                                        // console.log("I AM RUNNINGGGGGG 3");
+                                        const distance = getDistance(data.latitude, data.longitude,
+                                                            result.geometries[i].nearestLat, result.geometries[i].nearestLon) - geofenceDataForCheck.features[k].properties.radius/1000;
+                                        if(distance < miniMin){
+                                            miniMin = distance;
+                                        }
+                                    }
+                                }
+
+                                if(miniMin < minDistance){
+                                    minDistance = miniMin;
+                                    minDistanceId = result.geometries[i].geometryId;
+                                }
+
+                                if (result.geometries[i].distance < 0) {
+                                    insideAny = true;
+                                    if (!insideIds.includes(result.geometries[i].geometryId)) {
+                                        insideIds.push(result.geometries[i].geometryId);
+                                    }
+                                    if (minDistance > 0) {
+                                        minDistance = -minDistance;
+                                    }
+                                }
+
+                                console.log("Distance: ", minDistance);
+                            }
+
+                            if (geofenceDataForCheck.features.length > 0){
+                                if (minDistance <= 1)
+                                    approachEl.innerText = `Approaching Geofence ${minDistanceId}: (${(minDistance * 1000).toFixed(0)} m)`;
+                                else if (minDistance > 1)
+                                    approachEl.innerText = `Distance to the closest Geofence (ID: ${minDistanceId}): ${minDistance.toFixed(2)} km`;
+                                else if (insideAny)
+                                    approachEl.innerText = `Distance to the closest Geofence (ID: ${minDistanceId}): ${(minDistance * 1000).toFixed(0)} m`;
+                                updateApproach(minDistance, 10, insideAny);
+                            }
+                            if(insideAny){
+                                console.log(`ACTION: Inside Geofence(s) ID(s): ${insideIds.join(', ')}`);
+                                geofenceEl.innerText = `Inside Geofence(s) ID(s): ${insideIds}`;
+                                // *** TODO: Add visual feedback - e.g., change carSymbol color ***
+                                // Example: window.carSymbol.setOptions({ htmlContent: '<div style="... background-color: red; ..."></div>' });
+                            } else if (geofenceDataForCheck.features.length > 0){
+                                console.log("ACTION: Outside all checked Geofences");
+                                geofenceEl.innerText = `Outside all checked Geofences`;
+                                // *** TODO: Revert visual feedback if needed ***
+                                // Example: window.carSymbol.setOptions({ htmlContent: '<div style="... background-color: dodgerblue; ..."></div>' });
+                            }
+                        }
+                    })
+                    .catch(err => { // Catch errors from the checkGeofence call
+                        console.error("Error during background geofence check:", err);
+                    });
+                });
+
+                 // Handle connection closing
+                 signalRConnection.onclose(error => {
+                     console.error('SignalR connection closed.', error);
+                     statusEl.textContent = 'SignalR Disconnected. Retrying...';
+                     // Automatic reconnect handles retries, but log it.
+                 });
+
+                 // Handle reconnection attempts
+                 signalRConnection.onreconnecting(error => {
+                     console.warn('SignalR reconnecting due to error:', error);
+                     statusEl.textContent = 'SignalR Reconnecting...';
+                 });
+
+                 // Handle successful reconnection
+                 signalRConnection.onreconnected(connectionId => {
+                     console.log('SignalR reconnected with ID:', connectionId);
+                     statusEl.textContent = 'SignalR Reconnected - Waiting for GPS data...';
+                 });
+
+                // 3. Start the connection
+                await signalRConnection.start();
+                statusEl.textContent = 'SignalR Connected - Waiting for GPS data...';
+                console.log('SignalR connection started successfully!');
+
+            } catch (error) {
+                console.error('SignalR Connection Failed:', error);
+                statusEl.textContent = 'SignalR Connection Failed: ' + error.message;
+                // Consider a manual retry button or rely on automatic reconnect
+            }
+        }
+        // --- END THROTTLED GEOFENCE CHECK ---
+
+        //} // End connectSignalR
+
+        function searchAddress() {
+            const query = document.getElementById('searchInput').value.trim();
+            if (!query) return;
+            let url;
+            // Simple logic: if it contains letters only, treat as POI; otherwise, address
+            const isPOISearch = /^[a-zA-Z\s]+$/.test(query);
+            if (isPOISearch) {
+                url = `https://atlas.microsoft.com/search/poi/json?api-version=1.0&query=${query}&lat=10.762622&lon=106.660172&radius=9000`;
+
+            }
+            else {
+                const endpoint = isPOISearch ? 'search/poi/json' : 'search/address/json';
+                url = `https://atlas.microsoft.com/${endpoint}?api-version=1.0&query=${encodeURIComponent(query)}&lat=10.762622&lon=106.660172&radius=9000`;
+
+            }
+            fetch(url, {
+                headers: {
+                    "Subscription-Key": "YOUR-SUBSCRIPTION-KEY",
+                }
+            })
+                .then((response) => response.json())
+                .then((response) => {
+                    resultDatasource.clear();  // Clear previous results
+                    var bounds = [];
+
+                    var data = response.results
+                        .filter(result => {
+                            const pos = result.position;
+                            return pos &&
+                                typeof pos.lat === 'number' &&
+                                typeof pos.lon === 'number' &&
+                                isFinite(pos.lat) && isFinite(pos.lon) &&
+                                pos.lat >= -90 && pos.lat <= 90 &&
+                                pos.lon >= -180 && pos.lon <= 180;
+                        })
+                        .map(result => {
+                            var position = [result.position.lon, result.position.lat];
+                            bounds.push(position);
+                            return new atlas.data.Feature(new atlas.data.Point(position), { ...result });
+                        });
+
+                    resultDatasource.add(data);
+                    if (bounds.length > 0) {
+                        let boundingBox = atlas.data.BoundingBox.fromPositions(bounds);
+                        map.setCameraBounds({
+                            bounds: boundingBox,
+                            padding: 50,
+                            maxZoom: 16
+                        });
+                    }
+                })
+                .catch(err => console.error("Search error:", err));
+        }
+
+        function getDrawnShapes() {
+            // Clear the previous shapes
+            drawingManager.getSource().clear();
+            // Clear the output textarea
+            document.getElementById('CodeOutput').value = '';
+            // Fetch all geofences from the database
+            fetch('http://localhost:3000/getGeoJSON')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.features && Array.isArray(data.features)) {
+                        data.features.forEach(feature => {
+                            const shape = new atlas.Shape(feature);
+                            console.log("Shape:", shape);
+                            drawingManager.getSource().add(shape);
+                        });
+                        const geoJSONData = drawingManager.getSource().toJson();
+                        document.getElementById('CodeOutput').value = JSON.stringify(geoJSONData, null, 2);
+                    } else {
+                        console.error('Invalid data format: Expected an array of features.');
+                    }
+                })
+                .catch(error => {
+                    console.error('Error fetching GeoJSON from database:', error);
+                });
+        }
+        async function checkGeofence(lat, lon, geoJSONData){
+            let data;
+            // Example geofence shape (simplified polygon)
+            const geofenceData = geoJSONData;
+            console.log("Geofence Data:", geofenceData);
+            console.log("data look: ", JSON.stringify(geofenceData));
+
+            const url = 'https://us.atlas.microsoft.com/spatial/geofence/json?' + new URLSearchParams({
+                'api-version': '2022-08-01',
+                'subscription-key': 'YOUR-SUBSCRIPTION-KEY',
+                'deviceId': 'myDevice',
+                'lat': lat.toString(),
+                'lon': lon.toString(),
+            });
+            console.log("URL: ", url);
+            try {
+                const response = await fetch(url, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(geofenceData)
+                });
+
+                data = await response.json();
+                console.log("Geofence Check Result:", data);
+            } catch (err) {
+                console.log("Error:", err);
+            }
+            return data;
+        };
+
+        function insertToDatabase() {
+            var source = drawingManager.getSource();
+
+            // Convert the source into GeoJSON format
+            var geoJSONData = source.toJson();
+
+            // Example of how to transform the GeoJSON structure if needed
+            const transformedGeoJSON = JSON.stringify(source.toJson(), null, '    ');
+            const geoJSONobject = JSON.parse(transformedGeoJSON);
+            if (!geoJSONobject.features || geoJSONobject.features.length === 0) {
+                console.error('No shapes to insert.');
+                return;
+            }
+            // If needed, you can now have your data in the desired format
+            console.log(transformedGeoJSON);
+
+            // Send the GeoJSON data to the server to insert into the database
+            fetch('http://localhost:3000/insertGeoJSON', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(geoJSONobject.features[geoJSONobject.features.length - 1], null, '    ') // Send the GeoJSON data as a string
+            })
+                .then(response => response.json())
+                .then(data => {
+                    console.log('GeoJSON inserted into database');
+                    const allShapes = source.getShapes(); // Get all the shapes
+                    const lastShape = allShapes[allShapes.length - 1]; // Get the last shape
+                    if (lastShape) {
+                        source.remove(lastShape); // Remove the last shape
+                    }
+                    // Optionally, show a success message or refresh the drawing manager
+                })
+                .catch(error => {
+                    console.error('Error inserting GeoJSON:', error);
+                });
+        }
+        function togglePanel() {
+            const panel = document.querySelector('.sidePanel');
+            panel.classList.toggle('open');
+
+            const toggleBtn = document.getElementById('togglePanelBtn');
+            if (panel.classList.contains('open')) {
+                toggleBtn.textContent = '✖ Hide GeoJSON';
+            } else {
+                toggleBtn.textContent = '☰ View GeoJSON';
+            }
+        }
+        function searchRoute(latStart, lonStart, latEnd, lonEnd) {
+
+            // Create GeoJSON objects for start and end points
+            var startPoint = new atlas.data.Feature(new atlas.data.Point([lonStart, latStart]), {
+                title: "Start Point",
+                icon: "pin-round-blue"
+            });
+
+            var endPoint = new atlas.data.Feature(new atlas.data.Point([lonEnd, latEnd]), {
+                title: "End Point",
+                icon: "pin-round-blue"
+            });
+
+            // Add points to the datasource
+            // routeDatasource.add([startPoint, endPoint]);
+
+            // Set the map camera to fit the points
+            map.setCamera({
+                bounds: atlas.data.BoundingBox.fromData([startPoint, endPoint]),
+                padding: 80
+            });
+
+            // Construct the route query
+            var query = `${latStart},${lonStart}:${latEnd},${lonEnd}`;
+            console.log('Route query:', query);
+
+            var url = `https://atlas.microsoft.com/route/directions/json?api-version=1.0&query=${query}`;
+
+            // Fetch the route from the API
+            fetch(url, {
+                headers: {
+                    "Subscription-Key": "YOUR-SUBSCRIPTION-KEY",
+                }
+            })
+                .then((response) => response.json())
+                .then((response) => {
+                    console.log('Route API Response:', response);
+                    var route = response.routes[0];
+                    if (!route) {
+                        console.error('No route found in the API response.');
+                        return;
+                    }
+
+                    // Extract route coordinates
+                    var routeCoordinates = [];
+                    route.legs.forEach((leg) => {
+                        var legCoordinates = leg.points.map((point) => {
+                            return [point.longitude, point.latitude];
+                        });
+                        routeCoordinates = routeCoordinates.concat(legCoordinates);
+                    });
+
+
+                    // Add the route line to the datasource
+                    routeDatasource.add(new atlas.data.Feature(new atlas.data.LineString(routeCoordinates),
+                        {
+                            startPoint: startPoint,
+                            endPoint: endPoint,
+                        }
+                    ));
+                    console.log('Route coordinates:', routeDatasource.getShapes()[0].data.geometry.coordinates);
+                })
+                .catch((error) => {
+                    console.error('Error fetching route:', error);
+                });
+        }
+        function getDistance(lat1, lon1, lat2, lon2) {
+            const R = 6371; // Earth radius in kilometers
+            const dLat = deg2rad(lat2 - lat1);
+            const dLon = deg2rad(lon2 - lon1);
+            const a =
+                Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+                Math.cos(deg2rad(lat1)) * Math.cos(deg2rad(lat2)) *
+                Math.sin(dLon / 2) * Math.sin(dLon / 2);
+            const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+            const distance = R * c;
+            return distance;
+        }
+
+        function deg2rad(deg) {
+            return deg * (Math.PI / 180);
+        }        
+        
+        function start(map, routeDatasource) {
+            document.addEventListener("DOMContentLoaded", function () {
+                document.getElementById("traveled").innerText = "Starting...";
+                document.getElementById("remaining").innerText = "Starting...";
+                document.getElementById("approach").innerText = "Starting...";
+                document.getElementById("geofence").innerText = "Starting...";
+            });
+            // --- Corrected start function with throttling and async handling ---
+            const traveledEl = document.getElementById("traveled");
+            console.log("traveledEl: ", traveledEl);
+            const remainingEl = document.getElementById("remaining");
+            const approachEl = document.getElementById("approach");
+            const geofenceEl = document.getElementById("geofence");
+            let index = 0;
+            let distanceTraveled = 0;
+            let totalDistance = 0;
+            let remainingDistance = 0;
+            const targetSpeedKmPerHour = 100; // More realistic default speed
+            const targetSpeedMetersPerMs = (targetSpeedKmPerHour * 1000) / (60 * 60 * 1000);
+            const minDelayMs = 20; // Slightly increase min delay for stability
+            // Counter for throttling geofence checks
+            let geofenceCheckCounter = 0;
+            const checkGeofenceEveryNSteps = 5; // Check roughly every 15*50ms = 750ms (adjust as needed)
+
+            // --- Global variable setup ---
+            if (typeof window.carSymbol === 'undefined') { window.carSymbol = null; }
+            if (typeof window.animationInterval === 'undefined') { window.animationInterval = null; }
+            // --- End global setup ---
+
+            // Stop previous animation
+            if (window.stopAnimation) { stopAnimation(); }
+            else { if (window.animationInterval) { clearTimeout(window.animationInterval); window.animationInterval = null; } }
+
+            // --- Get Route Coordinates ---
+            const routeShape = routeDatasource.getShapes()[routeDatasource.getShapes().length - 1];
+
+            if (!routeShape) {
+                console.error("No route LineString available for animation.");
+                alert("No route loaded to animate.");
+                return;
+            }
+            const routeCoordinates = routeShape.data.geometry.coordinates;
+
+            if (!routeCoordinates || routeCoordinates.length < 2) {
+                console.error("No valid route coordinates found.");
+                return;
+            }
+            // --- End Get Route Coordinates ---
+            for(let i = 0; i < routeCoordinates.length-1; i++){
+                const lat = routeCoordinates[i][1];
+                const lon = routeCoordinates[i][0];
+                const nextLat = routeCoordinates[i + 1][1];
+                const nextLon = routeCoordinates[i + 1][0];
+                totalDistance += getDistance(lat, lon, nextLat, nextLon);
+                
+            }
+
+            // --- GET AND PREPARE GEOFENCE DATA ONCE ---
+            var geoJSONData = drawingManager.getSource().toJson();   
+            console.log("GeoJSON Data:", geoJSONData);
+            var validJSON = {
+                type: "FeatureCollection",
+                features: []
+            };    
+            for (let i = 0; i < geoJSONData.features.length; i++) 
+            {
+                if(geoJSONData.features[i].geometry.type == "Point" && !geoJSONData.features[i].properties.subType){
+                    console.warn("Invalid geofence found in the drawing manager source.");
+                    continue;
+                }
+                if (!geoJSONData.features[i].properties) {
+                    geoJSONData.features[i].properties = {};
+                }
+                geoJSONData.features[i].properties.geometryId = (i + 1).toString();
+                validJSON.features.push(geoJSONData.features[i]);
+            }
+            const geofenceDataForCheck = validJSON;
+            console.log("Geofence Data for Check:", geofenceDataForCheck);
+
+            if(geofenceDataForCheck.features.length === 0){
+                console.warn("No valid Polygon geofences found in the drawing manager source to check against.");
+            } else {
+                console.log("Prepared geofence data for checking:", geofenceDataForCheck);
+            }
+            // --- END GET GEOFENCE DATA ---
+
+            // --- Create or Update Car Symbol ---
+           if (!window.carSymbol) {
+                window.carSymbol = new atlas.HtmlMarker({
+                    position: routeCoordinates[0],
+                    // --- PASTE YOUR CAR SVG HTML HERE ---
+                    htmlContent:
+                    //#region
+                        `
+                    <div style="width: 30px; height:30px; transform: translate(-99%, -99%);">
+                        <svg version="1.0" xmlns="http://www.w3.org/2000/svg"
+                        width="50.000000pt" height="50.000000pt" viewBox="0 0 350.000000 350.000000"
+                        preserveAspectRatio="xMidYMid meet">
+                        <g transform="translate(0.000000,350.000000) scale(0.100000,-0.100000)"
+                        fill="#000000" stroke="none">
+                        <path d="M1815 3362 c-265 -79 -1063 -510 -1139 -615 -30 -41 -28 -105 4 -150
+                        32 -44 108 -105 196 -157 l67 -39 1 -143 c1 -138 2 -145 32 -208 37 -78 90
+                        -135 167 -178 52 -29 57 -35 57 -66 0 -32 -5 -37 -65 -70 l-64 -36 -116 47
+                        c-111 45 -117 49 -135 89 -22 50 -40 61 -175 103 -111 35 -152 38 -195 16 -90
+                        -47 -138 -209 -91 -310 27 -59 47 -72 172 -111 114 -35 138 -37 194 -14 28 11
+                        45 6 225 -67 123 -49 196 -84 198 -93 2 -11 -11 -19 -43 -28 -42 -11 -50 -19
+                        -95 -90 -28 -42 -50 -82 -50 -88 0 -8 -47 -13 -152 -16 -137 -3 -158 -6 -202
+                        -27 -61 -30 -115 -83 -167 -163 -44 -69 -47 -87 -20 -112 17 -16 19 -28 14
+                        -110 -5 -79 -2 -103 16 -159 29 -85 83 -168 154 -235 103 -96 81 -93 596 -92
+                        l449 0 39 -22 c37 -23 45 -23 383 -26 450 -4 743 9 805 37 89 39 189 175 229
+                        310 16 56 20 194 7 241 -6 19 -2 32 16 54 31 38 26 61 -35 151 -50 74 -92 108
+                        -151 125 -20 5 -108 10 -196 10 -88 0 -170 3 -181 6 -16 4 -26 23 -43 79 -21
+                        72 -53 115 -87 115 -15 0 -30 93 -24 155 10 124 5 170 -22 223 -15 29 -25 52
+                        -23 52 2 0 36 -27 75 -60 104 -87 130 -83 174 29 9 24 35 73 56 109 22 36 40
+                        74 40 84 0 48 -146 107 -237 94 -41 -5 -42 -5 -32 17 8 19 17 22 44 19 54 -6
+                        269 17 326 35 33 11 69 33 96 58 37 36 43 47 43 84 0 90 -63 215 -201 398 -44
+                        58 -79 107 -79 109 0 2 12 -1 28 -7 42 -16 203 -49 242 -49 146 0 231 113 167
+                        223 -48 82 -178 142 -324 148 -29 2 -53 4 -53 6 0 2 10 18 23 34 45 62 20 151
+                        -56 198 -99 61 -310 38 -450 -49 -27 -17 -50 -30 -52 -30 -3 0 -41 29 -85 65
+                        -135 109 -191 128 -295 97z m199 -76 c62 -42 231 -193 231 -206 0 -5 7 -15 15
+                        -22 12 -11 12 -11 1 5 -7 9 -9 17 -4 17 16 0 331 -326 406 -420 79 -98 189
+                        -261 182 -268 -3 -3 -15 4 -28 15 -37 34 -156 107 -257 158 -358 180 -814 297
+                        -1240 319 -94 5 -318 -9 -382 -23 -24 -6 -44 -9 -45 -7 -13 13 594 330 787
+                        411 196 83 241 85 334 21z m642 -35 c85 -39 99 -108 35 -172 -28 -28 -47 -39
+                        -69 -39 -16 0 -69 -11 -116 -25 l-87 -25 -94 86 c-52 48 -92 91 -89 96 9 14
+                        104 60 164 79 76 25 202 25 256 0z m223 -266 c130 -31 206 -93 206 -168 0 -47
+                        -33 -80 -97 -98 -48 -12 -155 4 -295 44 -76 22 -83 26 -154 101 -41 43 -75 82
+                        -77 87 -3 8 73 33 128 42 62 10 230 6 289 -8z m-1464 -145 c398 -36 795 -145
+                        1115 -305 188 -94 293 -169 352 -249 37 -51 36 -80 -5 -121 -48 -48 -118 -66
+                        -276 -72 -124 -5 -134 -4 -128 12 26 66 33 283 11 339 -10 25 5 20 101 -35
+                        163 -94 253 -177 239 -221 -7 -24 13 -23 26 2 51 96 -275 308 -683 444 -168
+                        57 -330 97 -536 133 -144 26 -175 28 -411 27 -230 0 -263 -2 -334 -22 -44 -12
+                        -94 -33 -113 -47 -34 -27 -45 -65 -18 -65 8 0 15 7 15 16 0 8 19 24 43 34 47
+                        21 207 50 275 50 l44 0 -35 -40 c-41 -49 -91 -140 -116 -213 -22 -62 -29 -63
+                        -108 -16 -81 49 -160 124 -174 166 -10 31 -9 39 8 62 73 97 382 151 708 121z
+                        m85 -96 c167 -19 385 -65 550 -114 145 -44 357 -125 377 -144 6 -6 17 -50 23
+                        -98 14 -105 2 -225 -31 -314 -31 -82 -121 -172 -204 -203 -228 -86 -652 -93
+                        -921 -15 -137 39 -231 110 -282 214 -25 51 -27 64 -27 180 0 195 52 341 162
+                        460 l56 61 86 -6 c47 -4 142 -13 211 -21z m-930 -838 c64 -69 37 -225 -49
+                        -283 -44 -30 -64 -29 -103 6 -27 24 -32 36 -36 88 -5 76 10 124 55 174 44 49
+                        95 54 133 15z m135 -29 c49 -18 63 -29 77 -57 46 -90 -12 -248 -99 -274 -18
+                        -6 -124 18 -142 31 -3 2 10 18 29 36 62 60 90 170 67 260 -9 32 -9 32 68 4z
+                        m584 -310 c48 -24 46 -110 -3 -156 -33 -31 -62 -26 -201 34 -60 25 -153 63
+                        -205 82 -52 20 -96 37 -98 38 -1 1 9 22 23 46 13 24 28 65 31 90 l6 47 212
+                        -84 c116 -47 222 -90 235 -97z m1043 146 c76 -116 57 -238 -53 -337 -76 -69
+                        -158 -92 -218 -61 -60 30 -56 78 14 156 55 61 72 109 40 109 -8 0 -15 -4 -15
+                        -10 0 -5 -23 -35 -50 -66 -56 -61 -70 -89 -70 -140 0 -34 0 -34 -45 -34 l-45
+                        0 44 43 c68 65 73 126 14 170 -24 18 -32 19 -63 10 -24 -8 -44 -8 -63 -1 -39
+                        14 -79 -4 -98 -46 -22 -45 -12 -80 37 -129 22 -22 38 -40 37 -41 -16 -6 -390
+                        11 -379 18 38 25 66 159 42 205 -9 16 2 16 150 13 167 -5 267 5 404 39 90 23
+                        231 87 259 118 26 28 29 27 58 -16z m-935 -125 c57 -54 45 -165 -25 -230 -49
+                        -46 -82 -55 -129 -37 -50 19 -51 34 -3 34 107 2 162 167 78 239 l-33 28 45 -6
+                        c25 -4 55 -17 67 -28z m438 -70 c19 -9 28 -9 37 0 17 17 54 15 72 -4 27 -27
+                        20 -76 -16 -111 -69 -65 -96 -65 -152 -3 -40 44 -46 82 -19 112 19 21 42 23
+                        78 6z m-550 -228 c33 1 208 2 388 2 294 1 334 -1 383 -18 53 -18 57 -18 125 0
+                        57 15 90 17 164 11 108 -8 114 -12 138 -98 l16 -58 -737 7 c-405 3 -741 10
+                        -746 14 -12 12 58 124 86 138 14 7 43 9 73 6 28 -4 77 -5 110 -4z m-380 -208
+                        c-46 -29 -117 -112 -148 -175 l-28 -57 -132 0 c-73 0 -138 4 -146 9 -20 13 27
+                        90 95 158 67 68 112 81 269 82 l120 1 -30 -18z m594 -29 c-63 -58 -139 -158
+                        -139 -185 0 -10 11 -29 24 -41 22 -21 23 -27 19 -112 -5 -77 -2 -100 19 -162
+                        l24 -73 -230 0 c-165 0 -238 4 -256 13 -17 9 -48 57 -102 162 -43 83 -77 156
+                        -78 164 0 23 68 127 122 186 87 95 83 94 387 95 l263 0 -53 -47z m376 18 c-45
+                        -27 -111 -106 -141 -167 l-26 -54 -148 0 c-80 0 -149 3 -153 6 -11 12 22 62
+                        85 129 92 99 106 104 273 105 l140 0 -30 -19z m1060 -3 c48 -12 118 -80 155
+                        -151 21 -40 23 -49 11 -56 -11 -7 -27 4 -60 41 -25 28 -60 57 -77 64 -23 10
+                        -151 15 -510 20 -553 8 -533 11 -614 -85 -29 -35 -51 -51 -67 -51 -12 0 -23 5
+                        -23 10 0 47 118 187 182 216 28 12 100 13 498 8 257 -3 483 -10 505 -16z
+                        m-897 -159 c3 -25 0 -27 -45 -34 -41 -6 -55 -14 -100 -61 -47 -49 -54 -53 -77
+                        -44 -32 12 -34 36 -3 44 12 3 34 23 49 45 32 45 100 83 143 79 24 -2 31 -8 33
+                        -29z m-31 -77 c35 -22 42 -115 14 -179 -41 -90 -151 -109 -151 -27 0 21 3 23
+                        19 14 51 -27 101 13 101 79 0 40 -23 81 -46 81 -21 0 -17 16 9 28 27 13 38 14
+                        54 4z m128 -39 c-7 -46 11 -83 47 -101 59 -28 127 35 116 108 -4 28 -2 30 26
+                        30 31 0 31 -1 28 -44 -7 -79 38 -119 102 -92 38 16 61 61 54 106 -4 27 -2 30
+                        21 30 25 0 26 -2 23 -44 -6 -76 35 -116 96 -95 35 12 52 45 52 99 0 36 3 40
+                        24 40 25 0 25 0 9 -37 -14 -36 -14 -116 0 -153 4 -10 -5 -22 -26 -35 l-32 -21
+                        -34 23 c-46 31 -107 31 -155 -2 l-36 -24 -36 24 c-55 37 -130 31 -180 -16 -19
+                        -18 -22 -18 -34 -4 -22 26 -66 45 -106 45 -33 0 -36 2 -30 23 14 51 17 105 8
+                        140 l-10 37 39 0 39 0 -5 -37z m809 9 c51 -54 57 -142 13 -189 -27 -30 -58
+                        -29 -90 3 -47 47 -48 144 -2 190 31 31 45 30 79 -4z m-2214 1 c0 -10 -3 -35
+                        -6 -55 l-7 -38 -119 0 c-130 0 -132 1 -120 60 l8 35 109 6 c61 3 116 6 123 7
+                        6 1 12 -6 12 -15z m1000 -4 c0 -5 -5 -30 -11 -55 l-12 -45 -131 3 -131 3 2 30
+                        c6 79 -2 75 148 75 88 0 135 -4 135 -11z m-1072 -125 c60 -7 60 -7 67 -43 3
+                        -20 8 -44 11 -53 5 -16 -5 -18 -114 -18 -83 0 -123 4 -130 13 -14 16 -26 83
+                        -17 96 7 12 91 14 183 5z m982 -14 l68 0 7 -46 c3 -26 9 -53 12 -60 4 -11 -19
+                        -14 -125 -14 l-130 0 -10 28 c-37 91 -29 107 51 98 33 -3 90 -6 127 -6z m504
+                        -82 c27 -12 66 -80 66 -114 0 -38 -21 -92 -45 -118 -44 -48 -111 -27 -139 46
+                        -25 61 -3 148 46 182 27 19 39 20 72 4z m270 -17 c26 -22 38 -58 37 -113 0
+                        -112 -81 -166 -147 -97 -26 27 -29 37 -29 94 0 49 5 71 21 92 39 52 76 60 118
+                        24z m199 18 c37 -17 60 -65 60 -124 0 -62 -24 -109 -66 -126 -24 -10 -32 -9
+                        -55 8 -80 59 -57 222 35 252 1 1 13 -4 26 -10z m220 0 c74 -33 77 -183 5 -233
+                        -59 -42 -111 8 -111 104 0 73 27 122 80 139 1 1 13 -4 26 -10z m-2049 -105
+                        c14 -26 26 -48 26 -50 0 -2 -51 -4 -113 -4 -119 0 -130 3 -161 50 -31 47 -25
+                        50 103 50 l119 0 26 -46z m984 -20 c13 -26 21 -49 18 -51 -3 -3 -60 -1 -128 3
+                        l-123 9 -23 43 -23 42 128 0 129 0 22 -46z m-898 -99 l34 -35 -115 0 -114 0
+                        -40 35 -40 34 121 1 120 0 34 -35z m966 -7 c54 -61 58 -58 -69 -58 -116 0
+                        -116 0 -152 31 -19 17 -35 35 -35 40 0 5 53 9 118 9 110 0 120 -2 138 -22z"/>
+                        <path d="M1257 2490 c-44 -35 -60 -155 -26 -196 18 -22 59 -13 82 18 24 32 35
+                        125 18 156 -19 36 -45 44 -74 22z"/>
+                        <path d="M1925 2443 c-25 -24 -35 -58 -35 -116 0 -68 21 -99 62 -95 48 5 73
+                        46 73 122 0 49 -4 69 -19 85 -23 25 -58 27 -81 4z"/>
+                        <path d="M456 1850 c-48 -57 -56 -141 -19 -182 67 -74 177 120 112 198 -20 25
+                        -65 17 -93 -16z"/>
+                        <path d="M821 831 c-40 -25 7 -31 260 -31 224 0 259 2 259 15 0 13 -33 15
+                        -239 15 -132 0 -245 2 -253 5 -7 3 -19 1 -27 -4z"/>
+                        </g>
+                        </svg>
+                    </div>
+                `,
+                    //#endregion
+                    // --- END SVG ---
+                    pixelOffset: [0, 0], // Handled by CSS transform
+                    anchor: 'center'
+                });
+                map.markers.add(window.carSymbol);
+            } else {
+                window.carSymbol.setOptions({ position: routeCoordinates[0] });
+                // Ensure marker is on map if it was removed previously
+                if (!map.markers.getMarkers().includes(window.carSymbol)) {
+                    map.markers.add(window.carSymbol);
+                }
+            }
+            // --- End Create/Update Symbol ---
+
+            moving = true; // Set the global flag
+
+            // --- moveCar is NOT async anymore ---
+            function moveCar() {
+                if (index >= routeCoordinates.length - 1 || !moving) {
+                    moving = false;
+                    if(window.carSymbol && routeCoordinates.length > 0){
+                        window.carSymbol.setOptions({ position: routeCoordinates[routeCoordinates.length - 1] });
+                         const finalPos = routeCoordinates[routeCoordinates.length - 1];
+                         console.log(`Animation Finished: Final position Lat: ${finalPos[1].toFixed(6)}, Lon: ${finalPos[0].toFixed(6)}`);
+                    }
+                    console.log("Animation finished or stopped.");
+                    stopAnimation(); // Use the stop function to clear interval
+                    return;
+                }
+
+                const currentPosition = routeCoordinates[index];
+                const nextPosition = routeCoordinates[index + 1];
+
+                // Update car position visually
+                window.carSymbol.setOptions({ position: currentPosition });
+                // console.log(`Step ${index}: Pos [Lon: ${currentPosition[0].toFixed(6)}, Lat: ${currentPosition[1].toFixed(6)}]`); // Optional log for position
+                // Calculate distance traveled
+                if (index > 0) {
+                    distanceTraveled += getDistance(currentPosition[1], currentPosition[0], nextPosition[1], nextPosition[0]);
+
+                }
+                remainingDistance = totalDistance - distanceTraveled;
+                traveledEl.innerText = `Distance Traveled: ${distanceTraveled.toFixed(2)} km`;
+                remainingEl.innerText = `Remaining Distance: ${remainingDistance.toFixed(2)} km`;
+                console.log(`Distance Traveled: ${distanceTraveled.toFixed(2)} km, Remaining: ${remainingDistance.toFixed(2)} km`); // Optional log for distance
+                // --- THROTTLED & ASYNC GEOFENCE CHECK ---
+                geofenceCheckCounter++;
+                if (geofenceCheckCounter >= checkGeofenceEveryNSteps && geofenceDataForCheck.features.length > 0) {
+                    geofenceCheckCounter = 0; // Reset counter
+                    console.log(`--- Triggering Geofence Check at Step ${index} ---`);
+
+                    // Call checkGeofence (which is async), handle result with .then()
+                    checkGeofence(
+                        currentPosition[1].toString(), // Use .toString() to avoid locale issues
+                        currentPosition[0].toString(),
+                        geofenceDataForCheck        // Pass the prepared data
+                    )
+                    .then(data => { // This block runs when the API call completes
+                        // console.log("Background Geofence Check Result:", data); // Log result here if needed
+                        if (data && data.geometries) {
+                            let insideAny = false;
+                            let insideIds = [];
+                            let minDistance = 99999999999;
+                            let minDistanceId = null;
+                            for (let i = 0; i < data.geometries.length; i++) {
+                                let miniMin = 99999999999;
+                                // console.log("CHECKKKK",geofenceDataForCheck);
+                                for (let k = 0; k < geofenceDataForCheck.features.length; k++) {
+                                    const feature = geofenceDataForCheck.features[k];
+                                    let featureMin = Infinity;
+                                    if (feature.geometry.type === "Polygon") {
+                                        const coords = feature.geometry.coordinates[0];
+
+                                        for (let j = 0; j < coords.length - 1; j++) {
+                                            const [lonA, latA] = coords[j];
+                                            const [lonB, latB] = coords[j + 1];
+
+                                            // First: Try intersection
+                                            const intersection = getLineIntersection(
+                                                currentPosition[1], currentPosition[0], // current lat, lon
+                                                data.geometries[i].nearestLat, data.geometries[i].nearestLon,
+                                                latA, lonA, latB, lonB
+                                            );
+
+                                            let dist;
+                                            if (intersection) {
+                                                dist = getDistance(
+                                                    currentPosition[1], currentPosition[0],
+                                                    intersection.lat, intersection.lon
+                                                );
+                                            } else {
+                                                // Fallback: point-to-segment distance
+                                                dist = pointToSegmentDistance(
+                                                    currentPosition[1], currentPosition[0], // lat, lon
+                                                    latA, lonA, latB, lonB
+                                                );
+                                            }
+
+                                            if (dist < featureMin) {
+                                                featureMin = dist;
+                                            }
+                                        }
+
+                                    } else if (feature.geometry.type === "Point" && feature.properties.subType === "Circle") {
+                                        const radiusKm = feature.properties.radius / 1000;
+                                        const centerLat = feature.geometry.coordinates[1];
+                                        const centerLon = feature.geometry.coordinates[0];
+                                        const dist = getDistance(currentPosition[1], currentPosition[0], centerLat, centerLon) - radiusKm;
+
+                                        if (dist < featureMin) {
+                                            featureMin = dist;
+                                        }
+                                    }
+
+                                    // Global minimum update
+                                    if (featureMin < minDistance) {
+                                        minDistance = featureMin;
+                                        minDistanceId = k+1;
+                                    }
+                                }
+                                console.log("Distance: ", minDistance);
+                                if (data.geometries[i].distance < 0) {
+                                    insideAny = true;
+                                    insideIds.push(data.geometries[i].geometryId);
+                                }
+            
+                            }
+                            approachEl.innerText = `Approaching Geofence ${minDistanceId}: (${minDistance.toFixed(2)} km)`;
+                            updateApproach(minDistance, totalDistance, insideAny);
+
+                            if(insideAny){
+                                console.log(`ACTION: Inside Geofence(s) ID(s): ${insideIds.join(', ')}`);
+                                geofenceEl.innerText = `Inside Geofence(s) ID(s): ${insideIds}`;
+                                updateApproach(-1, -1, true);
+                                // *** TODO: Add visual feedback - e.g., change carSymbol color ***
+                                // Example: window.carSymbol.setOptions({ htmlContent: '<div style="... background-color: red; ..."></div>' });
+                            } else if (geofenceDataForCheck.features.length > 0){
+                                console.log("ACTION: Outside all checked Geofences");
+                                geofenceEl.innerText = `Outside all checked Geofences`;
+                                // *** TODO: Revert visual feedback if needed ***
+                                // Example: window.carSymbol.setOptions({ htmlContent: '<div style="... background-color: dodgerblue; ..."></div>' });
+                            }
+                        }
+                    })
+                    .catch(err => { // Catch errors from the checkGeofence call
+                        console.error("Error during background geofence check:", err);
+                    });
+                }
+                // --- END THROTTLED GEOFENCE CHECK ---
+
+
+                // --- Calculate delay based on distance to next point ---
+                let delayMs = minDelayMs;
+                if (atlas.math && atlas.math.getDistanceTo) {
+                    const distanceMeters = atlas.math.getDistanceTo(currentPosition, nextPosition);
+                    if (targetSpeedMetersPerMs > 0 && distanceMeters > 0) {
+                        delayMs = distanceMeters / targetSpeedMetersPerMs;
+                    }
+                    delayMs = Math.max(delayMs, minDelayMs);
+                } else {
+                    console.warn("atlas.math.getDistanceTo not available. Using minimum delay.");
+                }
+                // --- End calculation ---
+
+                index++;
+
+                // --- Schedule the next move using CALCULATED delay ---
+                // Crucially, this happens *without* waiting for the geofence check
+                window.animationInterval = setTimeout(moveCar, delayMs);
+            }
+
+            console.log("Starting animation...");
+            moveCar(); // Start animation loop
+        }
+        // --- ADD OR ENSURE YOU HAVE A stopAnimation FUNCTION ---
+        // Make sure 'animationInterval' and 'moving' are accessible (e.g., global)
+        function getLineIntersection(x1, y1, x2, y2, x3, y3, x4, y4) {
+            const denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4);
+            if (denom === 0) return null; // Lines are parallel
+
+            const px = ((x1 * y2 - y1 * x2) * (x3 - x4) -
+                        (x1 - x2) * (x3 * y4 - y3 * x4)) / denom;
+            const py = ((x1 * y2 - y1 * x2) * (y3 - y4) -
+                        (y1 - y2) * (x3 * y4 - y3 * x4)) / denom;
+
+            // ✅ Check if intersection point lies on both line segments
+            if (
+                px < Math.min(x1, x2) - 1e-8 || px > Math.max(x1, x2) + 1e-8 ||
+                py < Math.min(y1, y2) - 1e-8 || py > Math.max(y1, y2) + 1e-8 ||
+                px < Math.min(x3, x4) - 1e-8 || px > Math.max(x3, x4) + 1e-8 ||
+                py < Math.min(y3, y4) - 1e-8 || py > Math.max(y3, y4) + 1e-8
+            ) {
+                return null; // Outside segment bounds
+            }
+
+            return { x: px, y: py };
+        }
+        function toRadians(degrees) {
+            return degrees * Math.PI / 180;
+        }
+
+        function haversine(lat1, lon1, lat2, lon2) {
+            const R = 6371; // Earth radius in km
+            const dLat = toRadians(lat2 - lat1);
+            const dLon = toRadians(lon2 - lon1);
+            const a = Math.sin(dLat/2)**2 +
+                    Math.cos(toRadians(lat1)) * Math.cos(toRadians(lat2)) *
+                    Math.sin(dLon/2)**2;
+            return 2 * R * Math.asin(Math.sqrt(a));
+        }
+
+        // Get shortest distance from point to line segment (lat/lon)
+        function pointToSegmentDistance(lat, lon, lat1, lon1, lat2, lon2) {
+            function toCartesian(lat, lon) {
+                const φ = toRadians(lat), λ = toRadians(lon);
+                const R = 6371;
+                return {
+                    x: R * Math.cos(φ) * Math.cos(λ),
+                    y: R * Math.cos(φ) * Math.sin(λ),
+                    z: R * Math.sin(φ)
+                };
+            }
+
+            const P = toCartesian(lat, lon);
+            const A = toCartesian(lat1, lon1);
+            const B = toCartesian(lat2, lon2);
+
+            // Compute vector AB and AP
+            const AB = { x: B.x - A.x, y: B.y - A.y, z: B.z - A.z };
+            const AP = { x: P.x - A.x, y: P.y - A.y, z: P.z - A.z };
+
+            // Project AP onto AB, clamp between 0 and 1
+            const ab2 = AB.x**2 + AB.y**2 + AB.z**2;
+            const ap_dot_ab = AP.x * AB.x + AP.y * AB.y + AP.z * AB.z;
+            const t = Math.max(0, Math.min(1, ap_dot_ab / ab2));
+
+            // Closest point on segment
+            const C = {
+                x: A.x + AB.x * t,
+                y: A.y + AB.y * t,
+                z: A.z + AB.z * t
+            };
+
+            // Compute distance between P and C in 3D, convert to arc distance
+            const dot = (P.x*C.x + P.y*C.y + P.z*C.z) / 
+                        (Math.sqrt(P.x**2 + P.y**2 + P.z**2) * Math.sqrt(C.x**2 + C.y**2 + C.z**2));
+            const angle = Math.acos(Math.max(-1, Math.min(1, dot)));
+            return 6371 * angle;
+        }
+
+        function isPointInsidePolygon(point, polygon) {
+            let [x, y] = point;
+            let inside = false;
+            for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+                let [xi, yi] = polygon[i];
+                let [xj, yj] = polygon[j];
+
+                const intersect = ((yi > y) !== (yj > y)) &&
+                                (x < (xj - xi) * (y - yi) / (yj - yi + 1e-12) + xi);
+                if (intersect) inside = !inside;
+            }
+            return inside;
+        }
+
+
+        function stopAnimation() {
+            moving = false; // Set the flag
+            if (window.animationInterval) {
+                clearTimeout(window.animationInterval); // Clear the scheduled timeout
+                window.animationInterval = null;
+                console.log("Animation Timeout Cleared.");
+            }
+            // Optional: Decide if you want to remove the marker when stopped
+            // if (window.carSymbol) {
+            //     map.markers.remove(window.carSymbol);
+            //     window.carSymbol = null; // Clear reference
+            // }
+        }
+        function updateApproach(distance, totalDistance, insideAny) {
+            var trackerElement = document.getElementById("tracker");
+            if (insideAny)
+            {
+                trackerElement.style.backgroundColor = "rgba(0, 255, 0, 0.8)"; // Green background
+                return;
+            }
+            // Change background color of the tracker based on the distance
+            if (distance < 0.5 ) {
+                trackerElement.style.backgroundColor = "rgba(234, 239, 44, 1)"; // Yellow background
+            } else {
+                trackerElement.style.backgroundColor = "rgba(255, 255, 255, 0.8)"; // Default (white) background
+            }
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            document.getElementById('startButton').addEventListener('click', () => {
+                if (!moving) {
+                    moving = true;
+                    start(map, routeDatasource);
+                }
+            });
+        });
+
+    </script>
+
+    <style>
+        html,
+        body {
+            margin: 0;
+            height: 100%;
+        }
+
+        .sidePanel {
+            position: absolute;
+            top: 50px;
+            left: -360px;
+            /* Start hidden to the left */
+            width: 350px;
+            height: 60%;
+            background-color: white;
+            border-right: 1px solid #ccc;
+            padding: 10px;
+            z-index: 10;
+            transition: left 0.3s ease;
+            /* Smooth slide animation */
+            overflow-y: auto;
+        }
+
+        .sidePanel.open {
+            left: 0;
+            /* Slide in */
+        }
+
+        #myMap {
+            width: 100%;
+            height: 100vh;
+        }
+
+        #CodeOutput {
+            width: 320px;
+            height: 450px;
+            overflow-y: auto;
+        }
+        #tracker {
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            z-index: 1000;
+            background: rgba(255, 255, 255, 0.8); /* Semi-transparent background */
+            padding: 8px 12px;
+            border-radius: 6px;
+            box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
+            font-family: sans-serif;
+            font-size: 14px;
+        }
+    </style>
+
+</head>
+
+<body onload="InitMap()">
+    <button id="togglePanelBtn" onclick="togglePanel()"
+        style="position: absolute; top: 10px; left: 50px; z-index: 20;">☰ View GeoJSON</button>
+    <div class="sidePanel">
+
+        <input type="button" value="Get drawn shapes" onclick="getDrawnShapes()" title="Get drawn shapes" />
+        <input type="button" value="Insert to Database" onclick="insertToDatabase()" title="Insert to Database" />
+        <textarea id="CodeOutput" title="Code Output"></textarea>
+        </table>
+    </div>
+    <form id="searchForm" onsubmit="searchAddress(); return false;"
+        style="position: absolute; top: 50px; right: 10px; z-index: 1000; background: white; padding: 10px; border-radius: 4px; box-shadow: 0 0 5px rgba(0,0,0,0.3);">
+        <input type="text" id="searchInput" placeholder="Search address or place..." style="width: 200px;" />
+        <button type="submit">Search</button>
+    </form>
+    <button id="startButton" style="position: absolute; top: 10px; left: 180px; z-index: 20;">▶ Start Route</button>
+    <div id="tracker">
+        <p id="traveled">Distance Traveled: -- km</p>
+        <p id="remaining">Remaining Distance: -- km</p>
+        <p id="approach">Distance to closest Geofence: -- km</p>
+        <p id="geofence">No valid geofences found to check against</p>
+      </div>
+    <div id="status" style="position: absolute; top: 50px; left: 200px; z-index: 20;">Initializing...</div>
+
+    <div id="myMap"></div>
+</body>
+
+</html>

@@ -1,0 +1,20 @@
+{
+  "scriptFile": "__init__.py",
+  "bindings": [
+    {
+      "name": "events",
+      "type": "eventHubTrigger",
+      "direction": "in",
+      "eventHubName": "YOUR-EVENT-HUB-COMPATIBLE-NAME",
+      "connection": "EventHubConnectionString",
+      "cardinality": "many"
+    },
+    {
+      "type": "signalR",
+      "name": "$return",
+      "hubName": "gpsHub",
+      "connectionStringSetting": "AzureSignalRConnectionString",
+      "direction": "out"
+    }
+  ]
+}
