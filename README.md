@@ -190,3 +190,17 @@ Check the following if you're having trouble:
 
 * ❗ **404 CSS/JS Errors**: Ensure the Azure Maps SDK URLs are correct and accessible.
 * ❗ **SignalR Fails to Connect**: Confirm your negotiation endpoint is correct and your Azure Function is running.
+
+---
+
+## 📫 Team Details
+
+**Group Members:**  
+Khoa Le Quang Minh · Khang Nguyen Duc · Khoa Tran Nguyen · Khoi Vo Nguyen Minh
+
+**Emails:**  
+[10423057@student.vgu.edu.vn](mailto:10423057@student.vgu.edu.vn)  
+[10423054@student.vgu.edu.vn](mailto:10423054@student.vgu.edu.vn)  
+[10423060@student.vgu.edu.vn](mailto:10423060@student.vgu.edu.vn)  
+[10423063@student.vgu.edu.vn](mailto:10423063@student.vgu.edu.vn)
+
