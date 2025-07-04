@@ -1,6 +1,6 @@
 ## 📍 Azure Maps Integration for Real-Time GPS Tracking
 
-This web application uses **Azure Maps** and **Azure SignalR** to display real-time GPS data from mobile devices. It also supports drawing geofences and detecting entry/exit events.
+This web application uses [**Azure Maps**](https://learn.microsoft.com/en-us/azure/azure-maps/about-azure-maps) and [**Azure SignalR**](https://learn.microsoft.com/en-us/azure/azure-signalr/signalr-overview) to display real-time GPS data from mobile devices. It also supports drawing geofences and detecting entry/exit events.
 
 ---
 
